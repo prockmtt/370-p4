@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 
 #define MAX_CACHE_SIZE 256
 #define MAX_BLOCK_SIZE 256
@@ -32,8 +33,7 @@ extern int mem_access(int addr, int write_flag, int write_data);
 extern int get_num_mem_accesses(void);
 
 //Use this when calling printAction. Do not modify the enumerated type below.
-enum actionType
-{
+enum actionType {
     cacheToProcessor,
     processorToCache,
     memoryToCache,
@@ -42,8 +42,7 @@ enum actionType
 };
 
 /* You may add or remove variables from these structs */
-typedef struct blockStruct
-{
+typedef struct blockStruct {
     int data[MAX_BLOCK_SIZE];
     int dirty;
     int lruLabel;
@@ -51,8 +50,7 @@ typedef struct blockStruct
     int valid;
 } blockStruct;
 
-typedef struct cacheStruct
-{
+typedef struct cacheStruct {
     blockStruct blocks[MAX_CACHE_SIZE];
     int blockSize;
     int numSets;
@@ -70,8 +68,7 @@ void printCache(void);
  * Set up the cache with given command line parameters. This is
  * called once in main(). You must implement this function.
  */
-void cache_init(int blockSize, int numSets, int blocksPerSet)
-{
+void cache_init(int blockSize, int numSets, int blocksPerSet) {
     if (blockSize <= 0 || numSets <= 0 || blocksPerSet <= 0) {
         printf("error: input parameters must be positive numbers\n");
         exit(1);
@@ -95,7 +92,10 @@ void cache_init(int blockSize, int numSets, int blocksPerSet)
     printf("Each set in the cache contains %d lines; there are %d sets\n",
         blocksPerSet, numSets);
 
-    /********************* Initialize Cache *********************/
+    // TODO check how I init cache
+    cache.blockSize = blockSize;
+    cache.blocksPerSet = blocksPerSet;
+    cache.numSets = numSets;
 
     return;
 }
@@ -110,12 +110,105 @@ void cache_init(int blockSize, int numSets, int blocksPerSet)
  * The return of mem_access is undefined if write_flag is 1.
  * Thus the return of cache_access is undefined if write_flag is 1.
  */
-int cache_access(int addr, int write_flag, int write_data)
-{
-    /* The next line is a placeholder to connect the simulator to
-    memory with no cache. You will remove this line and implement
-    a cache which interfaces between the simulator and memory. */
-    return mem_access(addr, write_flag, write_data);
+int cache_access(int addr, int write_flag, int write_data) {
+    // TODO: test!
+    // tag, index, block offset based on blockSize, numSets
+    // addr is a 16-bit LC2K word address
+    int blockOffsetSize = log2(cache.blockSize);
+    int setBitsSize = log2(cache.numSets);
+    // extract tag bits from address
+    int tag = addr >> (blockOffsetSize + setBitsSize);
+    // extract set index, block offset from address-- TODO check init
+    int mask = 1;
+    int blockOffset = addr | (mask << blockOffsetSize);
+    int setIndex = addr | (mask << (blockOffsetSize + setBitsSize));
+    setIndex >>= blockOffsetSize;
+    // debug printouts
+    printf("address: %d write_flag: %d write_data: %d\n", addr, write_flag, write_data);
+    printf("tag: 0x%08X blockOffset: %d setIndex: %d\n", 
+           tag, blockOffset, setIndex);
+
+    // check if tag is a hit in cache
+    bool foundInCache = false;
+    int idxFound = 0;
+    // TODO check how I'm accounting for sets in search through cache
+    for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+        if ((idx % cache.numSets) == setIndex && cache.blocks[idx].tag == tag) {
+            // hit!
+            foundInCache = true;
+            idxFound = idx;
+            continue;
+        }
+    }
+    if (!foundInCache) {
+        // cache miss case; pull from mem to cache before R/W
+        // first check if cache is full-- we know where to search in cache based 
+        // on set size and the set that our input would be put in. assume full
+        int idxToStore = 0;
+        bool full = true;
+        for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+            if ((idx % cache.numSets) == setIndex && !cache.blocks[idx].valid) {
+                full = false;
+                idxToStore = idx;
+            }
+        }
+        if (full) {
+            // eviction case
+            // find LRU
+            int lruIdx = 0;
+            int maxLru = 0;
+            for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+                if ((idx % cache.numSets) == setIndex && 
+                    cache.blocks[idx].lruLabel > maxLru) {
+                    maxLru = cache.blocks[idx].lruLabel;
+                    lruIdx = idx;
+                }
+            }
+            if (cache.blocks[lruIdx].dirty) {
+                // have to write back before evicting and replacing data
+                printAction(lruIdx, cache.blockSize, cacheToMemory);
+                // TODO write back for each word in block
+                mem_access(addr, write_flag, write_data);
+            }
+            cache.blocks[idxToStore].dirty = 0;
+        }
+        // atp, we've cleared/found idx to put data from mem
+        cache.blocks[idxToStore].valid = 1;
+        cache.blocks[idxToStore].tag = tag;
+        // fill in new empty spot
+        printAction(idxToStore, cache.blockSize, memoryToCache);
+        // TODO read in for each word in block
+        mem_access(addr, write_flag, write_data);
+        // update idxFound to reflect where data has now been placed
+        idxFound = idxToStore;
+    }
+    // cache hit OR after loading from mem to cache
+    // TODO test how I update LRU
+    cache.blocks[idxFound].lruLabel = 0;
+    for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+        if (idx != idxFound) {
+            cache.blocks[idx].lruLabel += 1;
+        }
+    }
+    if (write_flag) {
+        // write block to mem
+        // TODO make sure blockSize, idxFound used correct here 
+        printAction(idxFound, cache.blockSize, processorToCache);
+        cache.blocks[idxFound].dirty = 1;
+        cache.blocks[idxFound].valid = 1;
+        // NOTE: check what I should return here for "default val"
+        return 0;
+    }
+    else {
+        // reading from cache
+        // TODO make sure size init correct and idxFound used correct here 
+        int size = 1;
+        printAction(idxFound, size, cacheToProcessor);
+        // NOTE: need to make sure I'm returning right val here
+        // TODO read in for each word in block
+        return mem_access(addr, write_flag, write_data);
+    }
+    return 0;
 }
 
 
@@ -126,8 +219,7 @@ int cache_access(int addr, int write_flag, int write_data)
  * DO NOT delete this function, or else it won't compile.
  * DO NOT print $$$ in this function
  */
-void printStats(void)
-{
+void printStats(void) {
     printf("End of run statistics:\n");
     return;
 }
@@ -145,8 +237,7 @@ void printStats(void)
  *  -    cacheToMemory: evicting cache data and writing it to the memory
  *  -    cacheToNowhere: evicting cache data and throwing it away
  */
-void printAction(int address, int size, enum actionType type)
-{
+void printAction(int address, int size, enum actionType type) {
     printf("$$$ transferring word [%d-%d] ", address, address + size - 1);
 
     if (type == cacheToProcessor) {
@@ -176,8 +267,7 @@ void printAction(int address, int size, enum actionType type)
  * This is for debugging only and is not graded, so you may
  * modify it, but that is not recommended.
  */
-void printCache(void)
-{
+void printCache(void) {
     int blockIdx;
     int decimalDigitsForWaysInSet = (cache.blocksPerSet == 1) ? 1 : (int)ceil(log10((double)cache.blocksPerSet));
     printf("\ncache:\n");
