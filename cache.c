@@ -111,7 +111,7 @@ void cache_init(int blockSize, int numSets, int blocksPerSet) {
  * Thus the return of cache_access is undefined if write_flag is 1.
  */
 int cache_access(int addr, int write_flag, int write_data) {
-    // TODO: test!
+    // TODO: test and debug!
     // tag, index, block offset based on blockSize, numSets
     // addr is a 16-bit LC2K word address
     int blockOffsetSize = log2(cache.blockSize);
@@ -119,25 +119,26 @@ int cache_access(int addr, int write_flag, int write_data) {
     // extract tag bits from address
     int tag = addr >> (blockOffsetSize + setBitsSize);
     // extract set index, block offset from address-- TODO check init
-    int mask = 1;
+    int mask = 0;
     int blockOffset = addr | (mask << blockOffsetSize);
     int setIndex = addr | (mask << (blockOffsetSize + setBitsSize));
     setIndex >>= blockOffsetSize;
     // debug printouts
-    printf("address: %d write_flag: %d write_data: %d\n", addr, write_flag, write_data);
+    printf("address: %d\n", addr);
+    // printf("write_flag: %d write_data: %d\n", write_flag, write_data);
     printf("tag: 0x%08X blockOffset: %d setIndex: %d\n", 
            tag, blockOffset, setIndex);
 
     // check if tag is a hit in cache
     bool foundInCache = false;
     int idxFound = 0;
-    // TODO check how I'm accounting for sets in search through cache
+    // TODO fix how I find this-- currently using setIndex and tag wrong
     for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
         if ((idx % cache.numSets) == setIndex && cache.blocks[idx].tag == tag) {
             // hit!
             foundInCache = true;
             idxFound = idx;
-            continue;
+            break;
         }
     }
     if (!foundInCache) {
@@ -167,8 +168,12 @@ int cache_access(int addr, int write_flag, int write_data) {
             if (cache.blocks[lruIdx].dirty) {
                 // have to write back before evicting and replacing data
                 printAction(lruIdx, cache.blockSize, cacheToMemory);
-                // TODO write back for each word in block
-                mem_access(addr, write_flag, write_data);
+                // TODO check write back for each word in block (addr??)
+                int currWrite = 1;
+                for (int idx = 0; idx < cache.blockSize; ++idx) {
+                    int currData = cache.blocks[lruIdx].data[idx];
+                    mem_access(addr, currWrite, currData);
+                }
             }
             cache.blocks[idxToStore].dirty = 0;
         }
@@ -177,8 +182,11 @@ int cache_access(int addr, int write_flag, int write_data) {
         cache.blocks[idxToStore].tag = tag;
         // fill in new empty spot
         printAction(idxToStore, cache.blockSize, memoryToCache);
-        // TODO read in for each word in block
-        mem_access(addr, write_flag, write_data);
+        // TODO check how I read in for each word in block
+        int currWrite = 1;
+        for (int idx = 0; idx < cache.blockSize; ++idx) {
+            cache.blocks[idxToStore].data[idx] = mem_access(addr, currWrite, write_data);
+        }
         // update idxFound to reflect where data has now been placed
         idxFound = idxToStore;
     }
@@ -191,7 +199,7 @@ int cache_access(int addr, int write_flag, int write_data) {
         }
     }
     if (write_flag) {
-        // write block to mem
+        // write block to cache
         // TODO make sure blockSize, idxFound used correct here 
         printAction(idxFound, cache.blockSize, processorToCache);
         cache.blocks[idxFound].dirty = 1;
@@ -205,7 +213,7 @@ int cache_access(int addr, int write_flag, int write_data) {
         int size = 1;
         printAction(idxFound, size, cacheToProcessor);
         // NOTE: need to make sure I'm returning right val here
-        // TODO read in for each word in block
+        // TODO make sure reading in from right word in block
         return mem_access(addr, write_flag, write_data);
     }
     return 0;
