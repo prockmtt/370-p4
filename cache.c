@@ -56,6 +56,10 @@ typedef struct cacheStruct {
     int numSets;
     int blocksPerSet;
     // add any variables for end-of-run stats
+    int numHits;
+    int numMisses;
+    int numDirty;
+    int numWritebacks;
 } cacheStruct;
 
 /* Global Cache variable */
@@ -96,6 +100,16 @@ void cache_init(int blockSize, int numSets, int blocksPerSet) {
     cache.blockSize = blockSize;
     cache.blocksPerSet = blocksPerSet;
     cache.numSets = numSets;
+    cache.numHits = 0;
+    cache.numMisses = 0;
+    cache.numDirty = 0;
+    cache.numWritebacks = 0;
+    for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+        cache.blocks[idx].dirty = 0;
+        cache.blocks[idx].lruLabel = 0;
+        cache.blocks[idx].valid = 0;
+        cache.blocks[idx].tag = 0;
+    }
 
     return;
 }
@@ -111,107 +125,170 @@ void cache_init(int blockSize, int numSets, int blocksPerSet) {
  * Thus the return of cache_access is undefined if write_flag is 1.
  */
 int cache_access(int addr, int write_flag, int write_data) {
-    // TODO: test and debug!
+    // TODO: fix, debug
     // tag, index, block offset based on blockSize, numSets
     // addr is a 16-bit LC2K word address
     int blockOffsetSize = log2(cache.blockSize);
     int setBitsSize = log2(cache.numSets);
     // extract tag bits from address
     int tag = addr >> (blockOffsetSize + setBitsSize);
-    // extract set index, block offset from address-- TODO check init
-    int mask = 0;
-    int blockOffset = addr | (mask << blockOffsetSize);
-    int setIndex = addr | (mask << (blockOffsetSize + setBitsSize));
+    // extract set index, block offset from address-- 
+    // TODO adjust how I use blockOffset and setIdx in rest of code!!!
+    int mask = 0 << 16;
+    for (int i = 0; i < blockOffsetSize; ++i) {
+        mask |= (0b1 << i);
+    }
+    // printf("mask for block offset: 0x%08X\n", mask);
+    int blockOffset = addr & mask;
+    // printf("block offset: 0x%08X\n", blockOffset);
+    for (int i = 0; i < setBitsSize; ++i) {
+        mask |= (0b1 << (blockOffsetSize + i));
+    }
+    // printf("mask for set idx: 0x%08X\n", mask);
+    int setIndex = addr & mask;
     setIndex >>= blockOffsetSize;
+    // printf("set idx: 0x%08X\n", setIndex);
     // debug printouts
-    printf("address: %d\n", addr);
     // printf("write_flag: %d write_data: %d\n", write_flag, write_data);
-    printf("tag: 0x%08X blockOffset: %d setIndex: %d\n", 
-           tag, blockOffset, setIndex);
+    // printf("address: 0x%08x\n", addr);
+    // printf("tag: 0x%08X blockOffset: %d setIndex: %d\n", 
+    //        tag, blockOffset, setIndex);
 
+    int numLines = cache.numSets * cache.blocksPerSet;
     // check if tag is a hit in cache
     bool foundInCache = false;
     int idxFound = 0;
-    // TODO fix how I find this-- currently using setIndex and tag wrong
-    for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
-        if ((idx % cache.numSets) == setIndex && cache.blocks[idx].tag == tag) {
+    // TODO fix how I find this-- possibly using setIndex and tag wrong
+    for (int idx = 0; idx < numLines; ++idx) {
+        int currSet = idx % cache.numSets;
+        if (currSet == setIndex && cache.blocks[idx].valid && cache.blocks[idx].tag == tag) {
             // hit!
+            // printf("idx %d hit in cache\n", idx);
+            cache.numHits += 1;
             foundInCache = true;
             idxFound = idx;
             break;
         }
     }
     if (!foundInCache) {
+        cache.numMisses += 1;
+        // printf("addr 0x%08X not found in cache\n", addr);
         // cache miss case; pull from mem to cache before R/W
         // first check if cache is full-- we know where to search in cache based 
         // on set size and the set that our input would be put in. assume full
         int idxToStore = 0;
         bool full = true;
-        for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
-            if ((idx % cache.numSets) == setIndex && !cache.blocks[idx].valid) {
+        for (int idx = 0; idx < numLines; ++idx) {
+            int currSet = idx % cache.numSets;
+            if (currSet == setIndex && (!cache.blocks[idx].valid)) {
                 full = false;
                 idxToStore = idx;
+                // printf("next empty idx in cache: %d\n", idxToStore);
+                break;
             }
         }
         if (full) {
+            // printf("eviction case\n");
             // eviction case
             // find LRU
             int lruIdx = 0;
             int maxLru = 0;
-            for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+            for (int idx = 0; idx < numLines; ++idx) {
                 if ((idx % cache.numSets) == setIndex && 
+                    cache.blocks[idx].valid &&
                     cache.blocks[idx].lruLabel > maxLru) {
                     maxLru = cache.blocks[idx].lruLabel;
                     lruIdx = idx;
                 }
             }
+            // printf("lru index in cache: %d\n", lruIdx);
+            // set place to put data correctly?
+            idxToStore = lruIdx;
             if (cache.blocks[lruIdx].dirty) {
+                // printf("block dirty\n");
                 // have to write back before evicting and replacing data
-                printAction(lruIdx, cache.blockSize, cacheToMemory);
-                // TODO check write back for each word in block (addr??)
+                // TODO check how I calc this (should be tag and set idx of data
+                // being evicted)
+                int start = cache.blocks[idxToStore].tag << (blockOffsetSize + setBitsSize);
+                start |= setIndex << blockOffsetSize;
+                printAction(start, cache.blockSize, cacheToMemory);
+                // TODO check how I write back for each word in block
+                // writing to mem
                 int currWrite = 1;
                 for (int idx = 0; idx < cache.blockSize; ++idx) {
                     int currData = cache.blocks[lruIdx].data[idx];
-                    mem_access(addr, currWrite, currData);
+                    mem_access(start, currWrite, currData);
+                    start += 1;
                 }
+                cache.numWritebacks += 1;
+                // printCache();
+            }
+            else {
+                // removing from cache; cache to nowhere case
+                int start = cache.blocks[idxToStore].tag << (blockOffsetSize + setBitsSize);
+                start |= setIndex << blockOffsetSize;
+                printAction(start, cache.blockSize, cacheToNowhere);
+                // printCache();
             }
             cache.blocks[idxToStore].dirty = 0;
+            cache.numDirty -= 1;
         }
         // atp, we've cleared/found idx to put data from mem
         cache.blocks[idxToStore].valid = 1;
         cache.blocks[idxToStore].tag = tag;
         // fill in new empty spot
-        printAction(idxToStore, cache.blockSize, memoryToCache);
-        // TODO check how I read in for each word in block
-        int currWrite = 1;
-        for (int idx = 0; idx < cache.blockSize; ++idx) {
-            cache.blocks[idxToStore].data[idx] = mem_access(addr, currWrite, write_data);
+        // TODO check calcs
+        int end = addr + blockOffset;
+        if (blockOffset == 0) {
+            end = cache.blockSize;
+            // printf("if blockOffset is 0 end = %d\n", end);
         }
+        else if (blockOffset == cache.blockSize - 1) {
+            end = addr + 1;
+        }
+        int start = end - cache.blockSize;
+        // printf("start = end - block size = %d\n", start);
+        printAction(start, cache.blockSize, memoryToCache);
+        // we need to load in as many words from mem that fit in cache line
+        int startAddress = cache.blocks[idxToStore].tag << (blockOffsetSize + setBitsSize);
+        // make sure we start loading from right spot
+        startAddress += start;
+        // reading from mem
+        int currWrite = 0;
+        for (int idx = 0; idx < cache.blockSize; ++idx) {
+            cache.blocks[idxToStore].data[idx] = mem_access(startAddress, currWrite, write_data);
+            startAddress += 1;
+        }
+        // printCache();
         // update idxFound to reflect where data has now been placed
         idxFound = idxToStore;
     }
     // cache hit OR after loading from mem to cache
     // TODO test how I update LRU
     cache.blocks[idxFound].lruLabel = 0;
-    for (int idx = 0; idx < MAX_CACHE_SIZE; ++idx) {
+    for (int idx = 0; idx < numLines; ++idx) {
         if (idx != idxFound) {
             cache.blocks[idx].lruLabel += 1;
         }
     }
     if (write_flag) {
-        // write block to cache
-        // TODO make sure blockSize, idxFound used correct here 
-        printAction(idxFound, cache.blockSize, processorToCache);
+        // write word to cache
+        int size = 1;
+        // use size of 1 word and address
+        printAction(addr, size, processorToCache);
         cache.blocks[idxFound].dirty = 1;
+        cache.numDirty += 1;
         cache.blocks[idxFound].valid = 1;
         // NOTE: check what I should return here for "default val"
+        cache.blocks[idxFound].data[blockOffset] = mem_access(addr, write_flag, write_data);
+        // printCache();
         return 0;
     }
     else {
-        // reading from cache
-        // TODO make sure size init correct and idxFound used correct here 
+        // read word from cache-- TODO make sure size correct and idxFound is used 
+        // correctly here 
         int size = 1;
-        printAction(idxFound, size, cacheToProcessor);
+        printAction(addr, size, cacheToProcessor);
         // NOTE: need to make sure I'm returning right val here
         // TODO make sure reading in from right word in block
         return mem_access(addr, write_flag, write_data);
@@ -229,6 +306,8 @@ int cache_access(int addr, int write_flag, int write_data) {
  */
 void printStats(void) {
     printf("End of run statistics:\n");
+    printf("hits %d, misses %d, writebacks %d\n", cache.numHits, cache.numMisses, cache.numWritebacks);
+    printf("%d dirty cache blocks left\n", cache.numDirty);
     return;
 }
 
